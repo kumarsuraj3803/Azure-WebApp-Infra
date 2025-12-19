@@ -1,0 +1,191 @@
+
+# Parameters
+# parameters:
+# - name: env_deployment
+#   displayName: env_deployment
+#   type: string
+#   default: Dev
+#   values:
+#   - Dev
+#   - prod
+#   - uat
+
+# Triggers
+trigger:
+  branches:
+    include:
+    - master
+    - dev_feature1
+    - dev_feature2
+    exclude:
+    - prod_main
+    - uat_main
+
+# Pipeline-level pool (self-hosted agent)
+pool:
+  name: vmpool
+
+stages:
+- stage: stage1
+  displayName: Terraform init
+  jobs:
+  - job: job1
+    displayName: Terraform init job
+    steps:
+    - task: TerraformTask@5
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+        backendServiceArm: 'svc1'
+        backendAzureRmStorageAccountName: 'stg1640'
+        backendAzureRmContainerName: 'cont1640'
+        backendAzureRmKey: 'terraform.tfstate'
+
+- stage: stage2
+  displayName: Scan Tools
+  jobs:
+    - job: job1
+      displayName: tflint
+      steps:
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Stop on errors OFF
+            $ErrorActionPreference = "Continue"
+            
+            Write-Host "Running TFLint..."
+            
+            # Run TFLint
+            tflint
+            
+            # Check exit code
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "TFLint finished with warnings/errors, but pipeline will continue..."
+            }
+            
+            # Force script to exit successfully
+            exit 0
+    - job: job2
+      displayName: Tfsec_scanning
+      steps:
+      - task: tfsec@1
+        inputs:
+          version: 'v1.26.0'
+          dir: '''$(System.DefaultWorkingDirectory)'''
+        continueOnError: true
+    - job: job3
+      displayName: CheckovsScann
+      steps:
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            $ErrorActionPreference = "Continue"
+            
+            $pythonInstalled = Get-Command python -ErrorAction SilentlyContinue
+            if (-not $pythonInstalled) {
+                winget install --id Python.Python.3 --silent --accept-source-agreements --accept-package-agreements
+                $env:Path += ";C:\Python310\Scripts;C:\Python310\"
+                Start-Sleep -Seconds 5
+            }
+            
+            python -m pip install --upgrade pip
+            pip install checkov
+            checkov -d . --quiet
+            
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "Checkov finished with warnings/errors, but pipeline will continue..."
+            }
+            
+            exit 0
+        continueOnError: true    
+
+    - job: job4
+      displayName: trufflehog
+      steps:
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            pip install --upgrade trufflehog
+            trufflehog --version
+            trufflehog filesystem . --no-update
+            if ($LASTEXITCODE -ne 0) {
+            Write-Host "TruffleHog detected potential secrets"
+            exit 0
+            }
+        continueOnError: true
+        
+- stage: stage3
+  dependsOn: stage2
+  displayName: infracost
+  jobs:
+    - job: terraforminit
+      displayName: Terraform init job
+      steps:
+      - task: TerraformTask@5
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+          backendServiceArm: 'svc1'
+          backendAzureRmStorageAccountName: 'stg1640'
+          backendAzureRmContainerName: 'cont1640'
+          backendAzureRmKey: 'terraform.tfstate'
+    - job: terraform_plan
+      displayName: terraform_plan
+      steps: 
+      - task: TerraformTask@5
+        inputs:
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+          environmentServiceNameAzureRM: 'svc1'
+    - job: infracost
+      displayName: terraformPlan
+      steps:
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            $env:INFRACOST_API_KEY = "ico-ZsZmzjI7NzM5hoGcrhn7u3EJ2qfI4SDQ"
+            infracost breakdown --path "tfplan" --format table --out-file infracost.txt
+            displayName: "Generate Cost Report"
+            workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            $source = "$(System.DefaultWorkingDirectory)/environment/dev/infracost.txt"
+                            $destination = "$(Build.ArtifactStagingDirectory)/infracost.txt"
+                            New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)"
+                            Copy-Item $source $destination -Force
+                        displayName: "Move Infracost Report to Artifact Staging Directory"
+
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)/infracost.txt'
+                          ArtifactName: 'CostReport'
+                          publishLocation: 'Container'
+
+
+# - stage: Stage3
+#   dependsOn: stage1
+#   displayName: Terraform Plan
+#   jobs:
+#   - job: Init_Template
+#   - template: templates/template_init.yml
+
+#   - job: terraform_plan
+#     displayName: terraform_plan
+#     steps:
+#     - task: TerraformTask@5
+#       inputs:
+#         provider: 'azurerm'
+#         command: 'plan'
+#         workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+#         environmentServiceNameAzureRM: 'svc1'
